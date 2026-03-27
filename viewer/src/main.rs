@@ -85,8 +85,7 @@ async fn connect_ws(
     connected: &Arc<Mutex<bool>>,
     ctx: &egui::Context,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (ws_stream, _) =
-        tokio_tungstenite::connect_async("ws://127.0.0.1:3080/ws").await?;
+    let (ws_stream, _) = tokio_tungstenite::connect_async("ws://127.0.0.1:3080/ws").await?;
 
     *connected.lock().unwrap() = true;
     ctx.request_repaint();
@@ -123,14 +122,17 @@ impl eframe::App for ViewerApp {
         let items = self.items.lock().unwrap().clone();
         let is_connected = *self.connected.lock().unwrap();
 
-        // Auto-select newest item if a new one arrived
-        if let Some(newest) = items.last() {
-            if self.selected_id.as_ref() != Some(&newest.id) {
-                let was_some = self.selected_id.is_some();
+        // Keep the user's selection unless it disappears.
+        if let Some(selected_id) = &self.selected_id {
+            let selected_still_exists = items.iter().any(|item| &item.id == selected_id);
+            if !selected_still_exists {
+                self.selected_id = None;
+            }
+        }
+
+        if self.selected_id.is_none() {
+            if let Some(newest) = items.last() {
                 self.selected_id = Some(newest.id.clone());
-                if was_some {
-                    self.new_item_flash = 1.0;
-                }
             }
         }
 
@@ -176,9 +178,7 @@ impl eframe::App for ViewerApp {
                                 .inner_margin(8)
                                 .corner_radius(4)
                         } else {
-                            egui::Frame::NONE
-                                .inner_margin(8)
-                                .corner_radius(4)
+                            egui::Frame::NONE.inner_margin(8).corner_radius(4)
                         };
 
                         let response = frame
@@ -254,45 +254,50 @@ impl eframe::App for ViewerApp {
                     // Header
                     ui.horizontal(|ui| {
                         ui.heading(&item.title);
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.label(
-                                    egui::RichText::new(
-                                        item.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
-                                    )
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    item.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
+                                )
+                                .small()
+                                .color(egui::Color32::GRAY),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("from {}", item.source))
                                     .small()
-                                    .color(egui::Color32::GRAY),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!("from {}", item.source))
-                                        .small()
-                                        .color(egui::Color32::from_rgb(150, 150, 180)),
-                                );
-                            },
-                        );
+                                    .color(egui::Color32::from_rgb(150, 150, 180)),
+                            );
+                        });
                     });
                     ui.separator();
 
                     // Content
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.add_space(8.0);
-                        match item.content_type {
-                            ContentType::Markdown => {
-                                egui_commonmark::CommonMarkViewer::new()
-                                    .show(ui, &mut self.commonmark_cache, &item.content);
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .scroll_bar_visibility(
+                            egui::containers::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                        )
+                        .show(ui, |ui| {
+                            ui.add_space(8.0);
+                            match item.content_type {
+                                ContentType::Markdown => {
+                                    egui_commonmark::CommonMarkViewer::new().show(
+                                        ui,
+                                        &mut self.commonmark_cache,
+                                        &item.content,
+                                    );
+                                }
+                                ContentType::Html => {
+                                    // For v1, render HTML as monospace text
+                                    ui.label(
+                                        egui::RichText::new(&item.content)
+                                            .monospace()
+                                            .color(egui::Color32::from_rgb(220, 220, 220)),
+                                    );
+                                }
                             }
-                            ContentType::Html => {
-                                // For v1, render HTML as monospace text
-                                ui.label(
-                                    egui::RichText::new(&item.content)
-                                        .monospace()
-                                        .color(egui::Color32::from_rgb(220, 220, 220)),
-                                );
-                            }
-                        }
-                        ui.add_space(16.0);
-                    });
+                            ui.add_space(16.0);
+                        });
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.label(
