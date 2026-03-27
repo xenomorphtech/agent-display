@@ -4,7 +4,7 @@ Small Rust workspace for sending content to a local server and viewing it in a d
 
 ## Binaries
 
-- `llm-viewer-server`: local HTTP + WebSocket server on `127.0.0.1:3080`
+- `llm-viewer-server`: local HTTPS + secure WebSocket server on `127.0.0.1:3080`
 - `llm-viewer`: desktop viewer that fetches existing items and listens for live updates
 
 ## Run It
@@ -15,18 +15,31 @@ Start the server:
 cargo run -p llm-viewer-server
 ```
 
+If `--cert` and `--key` are not provided, the server generates a self-signed certificate automatically and stores it under `~/.local/share/llm-viewer-server/tls` by default. It also writes the API key to `.api_key` on first start. The default bind address is `0.0.0.0:3080`.
+
 Start the viewer in another terminal:
 
 ```bash
 cargo run -p llm-viewer
 ```
 
+## System Service
+
+Install the server as a systemd service:
+
+```bash
+./scripts/install-systemd-service.sh
+```
+
+The installed unit is `llm-viewer-server.service`. It runs as user `sdancer`, binds `0.0.0.0:3080` by default, starts after `network-online.target`, declares `After=spacetimedb.service`, and also waits for the configured `STDB_SERVER` endpoint to accept connections before launching the server process. When `ufw` or `firewalld` is active, the installer also opens `3080/tcp`.
+
 ## Push Markdown
 
 Send a markdown item to the server:
 
 ```bash
-curl -X POST http://127.0.0.1:3080/push \
+API_KEY=$(cat .api_key)
+curl -k -X POST "https://127.0.0.1:3080/push?api_key=${API_KEY}" \
   -H 'content-type: application/json' \
   -d '{
     "title": "Markdown test",

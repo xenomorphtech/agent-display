@@ -2,12 +2,15 @@
 
 import json
 import os
+from pathlib import Path
+import ssl
 import sys
 import urllib.error
 import urllib.request
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 
-SERVER_URL = os.environ.get("AGENT_DISPLAY_SERVER_URL", "http://127.0.0.1:3080")
+SERVER_URL = os.environ.get("AGENT_DISPLAY_SERVER_URL", "https://127.0.0.1:3080")
 PROTOCOL_VERSION = "2025-03-26"
 
 TOOLS = [
@@ -47,6 +50,37 @@ TOOLS = [
 ]
 
 
+def load_api_key() -> str | None:
+    key = os.environ.get("AGENT_DISPLAY_API_KEY") or os.environ.get("API_KEY")
+    if key:
+        key = key.strip()
+        if key:
+            return key
+
+    api_key_path = Path(".api_key")
+    if api_key_path.exists():
+        key = api_key_path.read_text().strip()
+        if key:
+            return key
+
+    return None
+
+
+def is_loopback_host(hostname: str | None) -> bool:
+    return hostname in {"localhost", "127.0.0.1", "::1"}
+
+
+def request_context():
+    parsed = urlparse(SERVER_URL)
+    if parsed.scheme == "https" and is_loopback_host(parsed.hostname):
+        return ssl._create_unverified_context()
+    return None
+
+
+API_KEY = load_api_key()
+TLS_CONTEXT = request_context()
+
+
 def write_message(message: dict) -> None:
     sys.stdout.write(json.dumps(message) + "\n")
     sys.stdout.flush()
@@ -77,15 +111,23 @@ def tool_text(text: str, structured_content=None, is_error: bool = False) -> dic
     return result
 
 
+def build_url(path: str) -> str:
+    parsed = urlparse(SERVER_URL)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    if API_KEY and "api_key" not in query:
+        query["api_key"] = API_KEY
+    return urlunparse(parsed._replace(path=path, params="", query=urlencode(query), fragment=""))
+
+
 def http_json(method: str, path: str, body=None):
     data = None if body is None else json.dumps(body).encode("utf-8")
     request = urllib.request.Request(
-        f"{SERVER_URL}{path}",
+        build_url(path),
         data=data,
         method=method,
         headers={"content-type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=10) as response:
+    with urllib.request.urlopen(request, timeout=10, context=TLS_CONTEXT) as response:
         return json.loads(response.read().decode("utf-8"))
 
 

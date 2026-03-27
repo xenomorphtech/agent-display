@@ -1,0 +1,22 @@
+[Unit]
+Description=LLM Viewer HTTPS server
+Documentation=file:///home/sdancer/agent-display-enhanced/README.md
+After=network-online.target spacetimedb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sdancer
+Group=sdancer
+WorkingDirectory=/home/sdancer/agent-display-enhanced
+Environment=HOME=/home/sdancer
+Environment=BIND_ADDR=0.0.0.0:3080
+EnvironmentFile=-/etc/default/llm-viewer-server
+TimeoutStartSec=0
+ExecStartPre=/usr/bin/bash -lc 'until /usr/bin/curl -sS --max-time 2 "${STDB_SERVER:-http://127.0.0.1:3001}/" >/dev/null 2>&1; do sleep 1; done'
+ExecStart=/usr/local/bin/llm-viewer-server
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

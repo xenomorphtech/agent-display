@@ -1,8 +1,14 @@
 use chrono::{DateTime, Utc};
 use eframe::egui;
 use futures_util::StreamExt;
+use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::{
+    net::IpAddr,
+    sync::{Arc, Mutex},
+};
+
+const DEFAULT_SERVER_URL: &str = "https://127.0.0.1:3080";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Item {
@@ -21,6 +27,36 @@ enum ContentType {
     Html,
 }
 
+#[derive(Clone)]
+struct ServerConfig {
+    items_url: String,
+    ws_url: String,
+    allow_invalid_certs: bool,
+}
+
+impl ServerConfig {
+    fn load() -> Self {
+        let raw_server_url = std::env::var("AGENT_DISPLAY_SERVER_URL")
+            .unwrap_or_else(|_| DEFAULT_SERVER_URL.to_string());
+        let server_url = Url::parse(&raw_server_url).unwrap_or_else(|error| {
+            eprintln!(
+                "warn: invalid AGENT_DISPLAY_SERVER_URL '{}': {error}; falling back to {}",
+                raw_server_url, DEFAULT_SERVER_URL
+            );
+            Url::parse(DEFAULT_SERVER_URL).expect("default server URL is valid")
+        });
+        let api_key = resolve_api_key();
+        let allow_invalid_certs = matches!(server_url.scheme(), "https" | "wss")
+            && is_loopback_host(server_url.host_str());
+
+        Self {
+            items_url: endpoint_url(&server_url, "/items", api_key.as_deref()),
+            ws_url: websocket_url(&server_url, "/ws", api_key.as_deref()),
+            allow_invalid_certs,
+        }
+    }
+}
+
 struct ViewerApp {
     items: Arc<Mutex<Vec<Item>>>,
     selected_id: Option<String>,
@@ -33,22 +69,33 @@ impl ViewerApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
+        let server = ServerConfig::load();
         let items: Arc<Mutex<Vec<Item>>> = Arc::new(Mutex::new(Vec::new()));
         let connected: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let ctx = cc.egui_ctx.clone();
 
         // Fetch existing items on startup
+        let items_client = http_client(server.allow_invalid_certs);
+        let items_url = server.items_url.clone();
         let items_clone = items.clone();
         let ctx_clone = ctx.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                if let Ok(resp) = reqwest::get("http://127.0.0.1:3080/items").await {
-                    if let Ok(fetched) = resp.json::<Vec<Item>>().await {
-                        let mut lock = items_clone.lock().unwrap();
-                        *lock = fetched;
-                        lock.reverse(); // Server returns newest first, we store oldest first
-                        ctx_clone.request_repaint();
+                match items_client.get(&items_url).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        if let Ok(fetched) = resp.json::<Vec<Item>>().await {
+                            let mut lock = items_clone.lock().unwrap();
+                            *lock = fetched;
+                            lock.reverse(); // Server returns newest first, we store oldest first
+                            ctx_clone.request_repaint();
+                        }
+                    }
+                    Ok(resp) => {
+                        eprintln!("warn: failed to fetch items: {}", resp.status());
+                    }
+                    Err(error) => {
+                        eprintln!("warn: failed to fetch items: {error}");
                     }
                 }
             });
@@ -58,11 +105,12 @@ impl ViewerApp {
         let items_ws = items.clone();
         let connected_ws = connected.clone();
         let ctx_ws = ctx.clone();
+        let ws_server = server.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
                 loop {
-                    let _ = connect_ws(&items_ws, &connected_ws, &ctx_ws).await;
+                    let _ = connect_ws(&items_ws, &connected_ws, &ctx_ws, &ws_server).await;
                     *connected_ws.lock().unwrap() = false;
                     ctx_ws.request_repaint();
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -84,8 +132,22 @@ async fn connect_ws(
     items: &Arc<Mutex<Vec<Item>>>,
     connected: &Arc<Mutex<bool>>,
     ctx: &egui::Context,
+    server: &ServerConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (ws_stream, _) = tokio_tungstenite::connect_async("ws://127.0.0.1:3080/ws").await?;
+    let (ws_stream, _) = if server.ws_url.starts_with("wss://") && server.allow_invalid_certs {
+        let mut builder = native_tls::TlsConnector::builder();
+        builder.danger_accept_invalid_certs(true);
+        let connector = builder.build()?;
+        tokio_tungstenite::connect_async_tls_with_config(
+            &server.ws_url,
+            None,
+            false,
+            Some(tokio_tungstenite::Connector::NativeTls(connector)),
+        )
+        .await?
+    } else {
+        tokio_tungstenite::connect_async(&server.ws_url).await?
+    };
 
     *connected.lock().unwrap() = true;
     ctx.request_repaint();
@@ -107,6 +169,62 @@ async fn connect_ws(
     }
 
     Ok(())
+}
+
+fn http_client(allow_invalid_certs: bool) -> Client {
+    Client::builder()
+        .danger_accept_invalid_certs(allow_invalid_certs)
+        .build()
+        .expect("HTTP client should build")
+}
+
+fn resolve_api_key() -> Option<String> {
+    std::env::var("AGENT_DISPLAY_API_KEY")
+        .ok()
+        .or_else(|| std::env::var("API_KEY").ok())
+        .or_else(|| std::fs::read_to_string(".api_key").ok())
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+}
+
+fn endpoint_url(base: &Url, path: &str, api_key: Option<&str>) -> String {
+    let mut url = base.clone();
+    url.set_path(path);
+    url.set_query(None);
+    if let Some(api_key) = api_key {
+        url.query_pairs_mut().append_pair("api_key", api_key);
+    }
+    url.to_string()
+}
+
+fn websocket_url(base: &Url, path: &str, api_key: Option<&str>) -> String {
+    let mut url = base.clone();
+    match url.scheme() {
+        "https" => {
+            let _ = url.set_scheme("wss");
+        }
+        "http" => {
+            let _ = url.set_scheme("ws");
+        }
+        _ => {}
+    }
+    url.set_path(path);
+    url.set_query(None);
+    if let Some(api_key) = api_key {
+        url.query_pairs_mut().append_pair("api_key", api_key);
+    }
+    url.to_string()
+}
+
+fn is_loopback_host(host: Option<&str>) -> bool {
+    match host {
+        Some("localhost") => true,
+        Some(host) => host
+            .parse::<IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false),
+        None => false,
+    }
 }
 
 impl eframe::App for ViewerApp {
